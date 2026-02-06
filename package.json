@@ -1,0 +1,5 @@
+{
+  "name": "weather-webhook",
+  "version": "1.0.0",
+  "description": "Weather API webhook for Customer.io"
+}
