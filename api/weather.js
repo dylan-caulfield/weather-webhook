@@ -1,5 +1,5 @@
 // api/weather.js
-// Multi-day weather forecast for entire stay (up to 7 days)
+// Multi-day weather forecast using OpenWeather FREE API (5 day / 3 hour forecast)
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -7,9 +7,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    const GOOGLE_WEATHER_API_KEY = process.env.GOOGLE_WEATHER_API_KEY;
+    const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 
-    if (!GOOGLE_WEATHER_API_KEY) {
+    if (!OPENWEATHER_API_KEY) {
+      console.error('OPENWEATHER_API_KEY not configured');
       throw new Error('API key not configured');
     }
 
@@ -18,107 +19,87 @@ export default async function handler(req, res) {
       check_out_date,
       property_latitude,
       property_longitude,
-      property_address,
       property_city,
       property_state,
-      property_zip_code,
       property_name,
       property_id
     } = req.body;
 
-    // Validate required fields
     if (!check_in_date || !check_out_date) {
-      console.warn('Missing check_in_date or check_out_date');
+      console.warn('Missing dates');
       return res.json(getFallbackWeather(check_in_date, check_out_date, property_city));
     }
 
-    // Get coordinates
     let latitude = property_latitude;
     let longitude = property_longitude;
 
-    // If no coordinates, geocode the address
+    // Simple validation
     if (!latitude || !longitude) {
-      console.log(`Geocoding property ${property_id}`);
-      
-      let addressString = '';
-      if (property_address) {
-        addressString = property_address;
-      } else if (property_city && property_state) {
-        addressString = `${property_city}, ${property_state}`;
-      } else if (property_city) {
-        addressString = property_city;
-      }
-
-      if (property_zip_code && !addressString.includes(property_zip_code)) {
-        addressString += ` ${property_zip_code}`;
-      }
-
-      if (!addressString) {
-        return res.json(getFallbackWeather(check_in_date, check_out_date, property_city));
-      }
-
-      const geocodeUrl = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-      geocodeUrl.searchParams.append('address', addressString);
-      geocodeUrl.searchParams.append('key', GOOGLE_WEATHER_API_KEY);
-
-      const geocodeResponse = await fetch(geocodeUrl.toString());
-      const geocodeData = await geocodeResponse.json();
-
-      if (geocodeData.status !== 'OK' || !geocodeData.results?.[0]) {
-        return res.json(getFallbackWeather(check_in_date, check_out_date, property_city));
-      }
-
-      latitude = geocodeData.results[0].geometry.location.lat;
-      longitude = geocodeData.results[0].geometry.location.lng;
+      console.warn('Missing coordinates');
+      return res.json(getFallbackWeather(check_in_date, check_out_date, property_city));
     }
 
-    // Calculate dates
     const checkinDate = new Date(check_in_date);
     const checkoutDate = new Date(check_out_date);
     const today = new Date();
     
     const daysUntilCheckin = Math.ceil((checkinDate - today) / (1000 * 60 * 60 * 24));
     const numberOfNights = Math.ceil((checkoutDate - checkinDate) / (1000 * 60 * 60 * 24));
-    const daysToShow = Math.min(numberOfNights, 7); // Cap at 7 days
+    const daysToShow = Math.min(numberOfNights, 5); // Free tier only gives 5 days
 
-    // Fetch weather from Google Weather API
-    const weatherUrl = new URL('https://weather.googleapis.com/v1/forecast');
-    weatherUrl.searchParams.append('key', GOOGLE_WEATHER_API_KEY);
-    weatherUrl.searchParams.append('location', `${latitude},${longitude}`);
-    weatherUrl.searchParams.append('units', 'imperial');
+    console.log(`Fetching weather for ${property_city}, days: ${daysToShow}`);
 
-    const weatherResponse = await fetch(weatherUrl.toString());
+    // Use FREE 5 day forecast API
+    const weatherUrl = `https://api.openweathermap.org/data/2.5/forecast?lat=${latitude}&lon=${longitude}&units=imperial&appid=${OPENWEATHER_API_KEY}`;
+    
+    const weatherResponse = await fetch(weatherUrl);
     
     if (!weatherResponse.ok) {
+      const errorText = await weatherResponse.text();
+      console.error(`OpenWeather error ${weatherResponse.status}:`, errorText);
       throw new Error(`Weather API error: ${weatherResponse.status}`);
     }
 
     const weatherData = await weatherResponse.json();
-    const allForecasts = weatherData.daily || weatherData.forecast?.daily || [];
+    console.log(`Received ${weatherData.list?.length || 0} forecast entries`);
 
-    // Build daily forecast array
+    // Group forecasts by day
+    const forecastsByDay = {};
+    
+    weatherData.list.forEach(entry => {
+      const entryDate = new Date(entry.dt * 1000);
+      const dateKey = entryDate.toISOString().split('T')[0];
+      
+      if (!forecastsByDay[dateKey]) {
+        forecastsByDay[dateKey] = [];
+      }
+      forecastsByDay[dateKey].push(entry);
+    });
+
+    // Build daily forecasts
     const dailyForecasts = [];
     
     for (let i = 0; i < daysToShow; i++) {
       const currentDate = new Date(checkinDate);
       currentDate.setDate(currentDate.getDate() + i);
+      const dateKey = currentDate.toISOString().split('T')[0];
       
-      const dayForecast = allForecasts.find(day => {
-        const forecastDate = new Date(day.date || day.time);
-        return forecastDate.toDateString() === currentDate.toDateString();
-      });
-
-      if (dayForecast) {
-        const temp = dayForecast.temperature || dayForecast.temp || {};
-        const condition = dayForecast.condition || dayForecast.weather?.[0] || {};
-        const precip = dayForecast.precipitation || dayForecast.rain || {};
-
-        const tempHigh = Math.round(temp.high || temp.max || 75);
-        const tempLow = Math.round(temp.low || temp.min || 60);
-        const precipChance = Math.round((precip.probability || precip.chance || 0) * 100);
-
+      const dayEntries = forecastsByDay[dateKey] || [];
+      
+      if (dayEntries.length > 0) {
+        const temps = dayEntries.map(e => e.main.temp);
+        const tempHigh = Math.round(Math.max(...temps));
+        const tempLow = Math.round(Math.min(...temps));
+        
+        const precipProbs = dayEntries.map(e => e.pop || 0);
+        const precipChance = Math.round(Math.max(...precipProbs) * 100);
+        
+        // Use midday forecast for conditions
+        const middayForecast = dayEntries[Math.floor(dayEntries.length / 2)] || dayEntries[0];
+        const condition = middayForecast.weather[0].description;
+        
         dailyForecasts.push({
-          date: currentDate.toISOString().split('T')[0],
+          date: dateKey,
           day_name: currentDate.toLocaleDateString('en-US', { weekday: 'long' }),
           day_short: currentDate.toLocaleDateString('en-US', { weekday: 'short' }),
           month_day: currentDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
@@ -126,19 +107,19 @@ export default async function handler(req, res) {
           is_checkout: i === daysToShow - 1,
           temp_high: tempHigh,
           temp_low: tempLow,
-          condition: condition.description || condition.main || 'Partly Cloudy',
-          condition_simple: simplifyCondition(condition.description || condition.main || 'Partly Cloudy'),
+          condition: condition.charAt(0).toUpperCase() + condition.slice(1),
+          condition_simple: simplifyCondition(condition),
           precipitation_chance: precipChance,
-          icon_url: condition.icon_url || condition.icon || ''
+          icon_url: `https://openweathermap.org/img/wn/${middayForecast.weather[0].icon}@2x.png`
         });
       }
     }
 
     if (dailyForecasts.length === 0) {
+      console.warn('No forecasts generated');
       return res.json(getFallbackWeather(check_in_date, check_out_date, property_city));
     }
 
-    // Calculate summary stats
     const tempHighs = dailyForecasts.map(d => d.temp_high);
     const tempLows = dailyForecasts.map(d => d.temp_low);
     const precipChances = dailyForecasts.map(d => d.precipitation_chance);
@@ -149,28 +130,17 @@ export default async function handler(req, res) {
     const minLow = Math.min(...tempLows);
     const avgPrecip = Math.round(precipChances.reduce((a, b) => a + b, 0) / precipChances.length);
     
-    // Check if any rain/snow days
     const rainyDays = dailyForecasts.filter(d => d.precipitation_chance > 40).length;
-    const hasRain = rainyDays > 0;
 
-    // Response
     const response = {
       success: true,
       show_weather: true,
-      
-      // Summary
       summary: generateSummary(dailyForecasts, avgHigh, avgLow, avgPrecip, numberOfNights, property_city),
-      
-      // Daily forecasts
       daily_forecasts: dailyForecasts,
-      
-      // Packing recommendations
       packing_recommendations: generatePackingList(maxHigh, minLow, avgPrecip, dailyForecasts),
-      
-      // Stats
       stats: {
-        check_in_date: check_in_date,
-        check_out_date: check_out_date,
+        check_in_date,
+        check_out_date,
         days_until_checkin: daysUntilCheckin,
         number_of_nights: numberOfNights,
         days_showing: daysToShow,
@@ -180,10 +150,8 @@ export default async function handler(req, res) {
         min_low: minLow,
         avg_precipitation: avgPrecip,
         rainy_days: rainyDays,
-        has_rain: hasRain
+        has_rain: rainyDays > 0
       },
-      
-      // Location
       location: {
         city: property_city || 'your destination',
         state: property_state || '',
@@ -192,11 +160,11 @@ export default async function handler(req, res) {
       }
     };
 
-    console.log('Weather success:', { property_id, days: dailyForecasts.length });
+    console.log('Success! Days:', dailyForecasts.length);
     return res.json(response);
 
   } catch (error) {
-    console.error('Weather error:', error.message);
+    console.error('Error:', error.message, error.stack);
     return res.json(getFallbackWeather(
       req.body.check_in_date,
       req.body.check_out_date,
@@ -205,122 +173,51 @@ export default async function handler(req, res) {
   }
 }
 
-// Simplify weather conditions to main types
 function simplifyCondition(condition) {
   const lower = condition.toLowerCase();
-  
-  if (lower.includes('rain') || lower.includes('drizzle') || lower.includes('shower')) {
-    return 'Rainy';
-  }
-  if (lower.includes('snow') || lower.includes('sleet') || lower.includes('ice')) {
-    return 'Snow';
-  }
-  if (lower.includes('thunder') || lower.includes('storm')) {
-    return 'Stormy';
-  }
-  if (lower.includes('cloud') || lower.includes('overcast')) {
-    return 'Cloudy';
-  }
-  if (lower.includes('clear') || lower.includes('sunny')) {
-    return 'Sunny';
-  }
-  if (lower.includes('partly') || lower.includes('mostly')) {
-    return 'Partly Cloudy';
-  }
-  if (lower.includes('fog') || lower.includes('mist') || lower.includes('haze')) {
-    return 'Foggy';
-  }
-  
+  if (lower.includes('rain') || lower.includes('drizzle')) return 'Rainy';
+  if (lower.includes('snow') || lower.includes('sleet')) return 'Snow';
+  if (lower.includes('thunder') || lower.includes('storm')) return 'Stormy';
+  if (lower.includes('cloud') || lower.includes('overcast')) return 'Cloudy';
+  if (lower.includes('clear') || lower.includes('sun')) return 'Sunny';
+  if (lower.includes('few clouds') || lower.includes('scattered')) return 'Partly Cloudy';
+  if (lower.includes('fog') || lower.includes('mist')) return 'Foggy';
   return 'Partly Cloudy';
 }
 
-// Generate overall summary
 function generateSummary(forecasts, avgHigh, avgLow, avgPrecip, nights, city) {
-  const conditions = forecasts.map(f => f.condition_simple);
-  const uniqueConditions = [...new Set(conditions)];
-  
   let summary = `The weather for your ${nights}-night stay in ${city} will be `;
-  
-  // Describe overall conditions
-  if (uniqueConditions.length === 1) {
-    summary += `${uniqueConditions[0].toLowerCase()}`;
-  } else if (avgPrecip > 50) {
-    summary += 'mostly rainy';
-  } else if (avgPrecip > 30) {
-    summary += 'mixed with some rain';
-  } else {
-    summary += 'pleasant';
-  }
-  
-  // Add temperature range
+  if (avgPrecip > 50) summary += 'mostly rainy';
+  else if (avgPrecip > 30) summary += 'mixed with some rain';
+  else summary += 'pleasant';
   summary += ` with temperatures ranging from ${avgLow}°F to ${avgHigh}°F.`;
-  
   return summary;
 }
 
-// Generate packing list
 function generatePackingList(maxHigh, minLow, avgPrecip, forecasts) {
   const items = [];
+  if (maxHigh > 85) items.push('Light, breathable clothing', 'Sunscreen and sunglasses');
+  else if (maxHigh > 75) items.push('Summer clothing', 'Sunscreen');
+  else if (maxHigh < 60) items.push('Warm clothing', 'Jacket or coat');
   
-  // Temperature-based
-  if (maxHigh > 85) {
-    items.push('Light, breathable clothing');
-    items.push('Sunscreen and sunglasses');
-    items.push('Hat for sun protection');
-  } else if (maxHigh > 75) {
-    items.push('Summer clothing');
-    items.push('Sunscreen');
-  } else if (maxHigh > 65) {
-    items.push('Light layers');
-  } else if (maxHigh < 60) {
-    items.push('Warm clothing');
-    items.push('Jacket or coat');
-  }
+  if (minLow < 60) items.push('Warm layers for evenings');
+  if (maxHigh - minLow > 25) items.push('Versatile layers for temperature changes');
+  if (avgPrecip > 60) items.push('Rain jacket', 'Umbrella');
+  else if (avgPrecip > 30) items.push('Rain jacket or umbrella');
   
-  // Cold evenings
-  if (minLow < 60) {
-    items.push('Warm layers for evenings');
-  }
-  
-  // Temperature variation
-  const tempRange = maxHigh - minLow;
-  if (tempRange > 25) {
-    items.push('Versatile layers for temperature changes');
-  }
-  
-  // Rain/precipitation
-  if (avgPrecip > 60) {
-    items.push('Rain jacket');
-    items.push('Waterproof shoes');
-    items.push('Umbrella');
-  } else if (avgPrecip > 30) {
-    items.push('Rain jacket or umbrella');
-  }
-  
-  // Check for snow
   const hasSnow = forecasts.some(f => f.condition_simple === 'Snow');
-  if (hasSnow) {
-    items.push('Winter boots');
-    items.push('Warm winter coat');
-  }
+  if (hasSnow) items.push('Winter boots', 'Warm coat');
   
-  // Remove duplicates and limit to top 5
-  const uniqueItems = [...new Set(items)];
-  return uniqueItems.slice(0, 5);
+  return [...new Set(items)].slice(0, 5);
 }
 
-// Fallback
 function getFallbackWeather(checkInDate, checkOutDate, city) {
   return {
     success: false,
     show_weather: false,
     summary: `We hope you have wonderful weather during your stay${city ? ' in ' + city : ''}!`,
     packing_recommendations: ['Pack comfortable clothes', 'Check local forecast before departure'],
-    stats: {
-      check_in_date: checkInDate,
-      check_out_date: checkOutDate
-    },
+    stats: { check_in_date: checkInDate, check_out_date: checkOutDate },
     fallback: true
   };
 }
----
